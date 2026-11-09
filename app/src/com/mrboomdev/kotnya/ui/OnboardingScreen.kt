@@ -215,7 +215,7 @@ private fun TermuxStep(controller: IdeController) {
 private fun JavaStep(controller: IdeController) {
     Text(
         "The Kotlin Toolchain and sdkmanager both run on a Java runtime. Kotnya installs it as the " +
-            "openjdk-21 Termux package.",
+            "openjdk-25 Termux package.",
         style = MaterialTheme.typography.bodyMedium,
     )
 

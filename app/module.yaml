@@ -11,6 +11,10 @@ dependencies:
   - $compose.uiTooling
   - androidx.compose.foundation:foundation-layout:1.12.1
   - androidx.compose.material3:material3:1.5.0-alpha22
+  # The code editor widget AndroidIDE uses; wrapped in an AndroidView.
+  - io.github.rosemoe:editor:0.24.6
+  - $libs.androidx.navigation3.runtime
+  - $libs.androidx.navigation3.ui
 
 settings:
   compose: enabled

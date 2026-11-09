@@ -53,6 +53,16 @@ class KotlinCompiler(private val terminal: TerminalModule) {
             return@channelFlow
         }
 
+        val javaHome = findJavaHome(terminal.bootstrap.prefixDir)
+        if (javaHome == null) {
+            send(
+                CompilerEvent.Failed(
+                    "No Java 25 runtime was found. Install the Java runtime in the SDK manager first."
+                )
+            )
+            return@channelFlow
+        }
+
         val argv = buildList {
             add(terminal.bootstrap.shellPath.absolutePath)
             add(request.toolchain.launcher.absolutePath)
@@ -63,7 +73,14 @@ class KotlinCompiler(private val terminal: TerminalModule) {
         val command = ShellCommand(
             argv = argv,
             workingDirectory = request.projectDirectory,
-            environment = request.environment + mapOf("KOTLIN_CLI_NO_WELCOME_BANNER" to "1"),
+            environment = request.environment + mapOf(
+                "KOTLIN_CLI_NO_WELCOME_BANNER" to "1",
+                // Without this the launcher downloads its own JRE, which uses a hard-link lock that
+                // Android refuses on app-private storage and then loops forever. Java 25 is already
+                // installed for the toolchain, so point the launcher at it instead.
+                "KOTLIN_CLI_JAVA_HOME" to javaHome.absolutePath,
+                "JAVA_HOME" to javaHome.absolutePath,
+            ),
         )
 
         send(CompilerEvent.Started(command.displayName))

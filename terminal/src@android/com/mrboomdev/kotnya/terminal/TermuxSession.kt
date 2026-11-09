@@ -18,7 +18,10 @@ class TermuxSession internal constructor(
 ) : Closeable {
 
     val pid: Int get() = terminalSession.pid
-    val isRunning: Boolean get() = terminalSession.isRunning
+
+    // A session that has never been rendered has no shell yet and reports pid 0. Termux's own
+    // isRunning() treats that as running, so check the pid ourselves.
+    val isRunning: Boolean get() = terminalSession.pid > 0 && terminalSession.isRunning
     val exitStatus: Int get() = terminalSession.exitStatus
     val title: String? get() = terminalSession.title
 
@@ -49,7 +52,9 @@ class TermuxSession internal constructor(
     fun interrupt() = write("\u0003")
 
     override fun close() {
-        terminalSession.finishIfRunning()
+        // finishIfRunning() calls Os.kill(pid, SIGKILL). For an uninitialized session the pid is 0,
+        // and kill(0, ...) targets the caller's whole process group, which kills this app.
+        if (terminalSession.pid > 0) terminalSession.finishIfRunning()
     }
 }
 

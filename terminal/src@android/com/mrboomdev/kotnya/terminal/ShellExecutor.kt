@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -60,6 +61,11 @@ data class ShellResult(val exitCode: Int, val stdout: String, val stderr: String
  */
 class ShellExecutor(private val bootstrap: TermuxBootstrap) {
 
+    private companion object {
+        /** How long to keep reading output after the process itself has exited. */
+        const val STREAM_DRAIN_TIMEOUT_MS = 2_000L
+    }
+
     /** Builds a `bash -c` command with the Termux environment. */
     fun script(
         script: String,
@@ -86,12 +92,20 @@ class ShellExecutor(private val bootstrap: TermuxBootstrap) {
 
         try {
             val exitCode = withContext(Dispatchers.IO) { process.waitFor() }
-            // Make sure the readers have drained both streams before announcing the exit.
-            stdoutJob.join()
-            stderrJob.join()
+
+            // A build daemon or another child process can keep the pipe open after the main
+            // process exits. Drain what is there, but never wait forever for an EOF that will not
+            // come; otherwise a finished build looks like it is still running.
+            withTimeoutOrNull(STREAM_DRAIN_TIMEOUT_MS) { stdoutJob.join() }
+            withTimeoutOrNull(STREAM_DRAIN_TIMEOUT_MS) { stderrJob.join() }
+            stdoutJob.cancel()
+            stderrJob.cancel()
+
             send(ShellEvent.Finished(exitCode))
         } finally {
             if (process.isAlive) process.destroy()
+            runCatching { process.inputStream.close() }
+            runCatching { process.errorStream.close() }
         }
     }.flowOn(Dispatchers.IO)
 
@@ -128,6 +142,10 @@ class ShellExecutor(private val bootstrap: TermuxBootstrap) {
             .directory(command.workingDirectory)
             .apply { environment().putAll(bootstrap.environment(command.environment)) }
             .start()
+            .also { process ->
+                // Close stdin so a command that unexpectedly prompts cannot wait for input forever.
+                runCatching { process.outputStream.close() }
+            }
     }
 
     private suspend fun SendChannel<ShellEvent>.pump(stream: InputStream, name: ShellStream) {

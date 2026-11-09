@@ -94,14 +94,20 @@ class KotlinToolchainManager(
 
     fun uninstall(version: String): Boolean = directoryFor(version).deleteRecursively()
 
-    /** Whether a Java runtime is available in the Termux prefix, which the toolchain needs to run. */
+    /** Whether a Java runtime new enough for the Kotlin CLI is available in the Termux prefix. */
     suspend fun hasJavaRuntime(): Boolean {
         val java = javaBinary()
         if (!java.canExecute()) return false
 
-        return terminal.shell.run(
+        val result = terminal.shell.run(
             ShellCommand(listOf(java.absolutePath, "-version"), terminal.bootstrap.homeDir)
-        ).isSuccess
+        )
+
+        if (!result.isSuccess) return false
+
+        // Kotlin CLI 0.13.0 is compiled for Java 25, so an older JDK cannot run it.
+        val major = JAVA_VERSION.find(result.output)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        return major != null && major >= MIN_JAVA_VERSION
     }
 
     /**
@@ -111,7 +117,7 @@ class KotlinToolchainManager(
      * name and its apt/dpkg binaries look for `/data/data/com.termux/files/usr`, which does not exist
      * inside this app. The .deb archives are unpacked directly instead.
      */
-    fun installJavaRuntime(packageName: String = "openjdk-21"): Flow<PackageEvent> = channelFlow {
+    fun installJavaRuntime(packageName: String = "openjdk-25"): Flow<PackageEvent> = channelFlow {
         require(TERMUX_PACKAGE_NAME.matches(packageName)) {
             "Invalid Termux package name: $packageName"
         }
@@ -125,7 +131,7 @@ class KotlinToolchainManager(
 
         if (failed) return@channelFlow
 
-        val javaHome = javaHome()
+        val javaHome = findJavaHome(terminal.bootstrap.prefixDir)
         if (javaHome == null) {
             send(PackageEvent.Failed(packageName, "The $packageName package does not contain bin/java"))
             return@channelFlow
@@ -144,12 +150,6 @@ class KotlinToolchainManager(
             send(PackageEvent.Failed(packageName, "java -version failed: ${result.output.take(500)}"))
         }
     }.flowOn(Dispatchers.IO)
-
-    /** The JDK directory, e.g. `$PREFIX/lib/jvm/java-21-openjdk`. */
-    private fun javaHome(): File? = File(terminal.bootstrap.prefixDir, "lib/jvm")
-        .listFiles()
-        ?.filter(File::isDirectory)
-        ?.firstOrNull { File(it, "bin/java").isFile }
 
     /** Termux exposes the JDK tools through `$PREFIX/bin`, so mirror that with relative symlinks. */
     private fun createJavaLinks(javaHome: File) {
@@ -181,8 +181,23 @@ class KotlinToolchainManager(
 
     private fun directoryFor(version: String): File = File(storageDirectory, version)
 
-    private companion object {
+    internal companion object {
         val TERMUX_PACKAGE_NAME = Regex("[A-Za-z0-9@._+-]+")
         val JAVA_TOOLS = listOf("java", "javac", "jar", "keytool", "jarsigner")
     }
 }
+
+/**
+ * The newest JDK in the Termux prefix, e.g. `$PREFIX/lib/jvm/java-25-openjdk`.
+ *
+ * Kotlin CLI requires Java 25; preferring the newest directory also means installing `openjdk-25`
+ * next to an older JDK upgrades the build toolchain without removing the old runtime.
+ */
+internal fun findJavaHome(prefixDir: File): File? = File(prefixDir, "lib/jvm")
+    .listFiles()
+    ?.filter(File::isDirectory)
+    ?.filter { File(it, "bin/java").canExecute() }
+    ?.maxByOrNull { it.name }
+
+private const val MIN_JAVA_VERSION = 25
+private val JAVA_VERSION = Regex("""version "(\d+)""")

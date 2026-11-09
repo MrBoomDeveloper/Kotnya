@@ -2,21 +2,26 @@ package com.mrboomdev.kotnya
 
 import android.content.Context
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.navigation3.runtime.NavKey
 import com.mrboomdev.kotnya.compiler.AndroidSdk
 import com.mrboomdev.kotnya.compiler.CompileRequest
 import com.mrboomdev.kotnya.compiler.CompilerEvent
 import com.mrboomdev.kotnya.compiler.CompilerModule
 import com.mrboomdev.kotnya.compiler.DEFAULT_TOOLCHAIN_VERSION
+import com.mrboomdev.kotnya.compiler.KeystoreRequest
 import com.mrboomdev.kotnya.compiler.KotlinToolchain
 import com.mrboomdev.kotnya.compiler.NewProject
 import com.mrboomdev.kotnya.compiler.PackageEvent
+import com.mrboomdev.kotnya.compiler.ProjectHistory
 import com.mrboomdev.kotnya.compiler.ProjectTemplate
 import com.mrboomdev.kotnya.compiler.SdkCatalog
 import com.mrboomdev.kotnya.compiler.SdkEvent
 import com.mrboomdev.kotnya.compiler.SdkPackage
 import com.mrboomdev.kotnya.compiler.SdkPackages
+import com.mrboomdev.kotnya.compiler.SigningConfig
 import com.mrboomdev.kotnya.compiler.TermuxBootstrapRelease
 import com.mrboomdev.kotnya.compiler.ToolchainEvent
 import com.mrboomdev.kotnya.terminal.BootstrapSource
@@ -33,18 +38,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-sealed interface Screen {
-    data object Projects : Screen
-    data object NewProject : Screen
-    data object Settings : Screen
-    data object SdkDashboard : Screen
-    data class Editor(val project: ProjectInfo) : Screen
-}
-
 /** The screens of the first-run setup. The first three components are required by the IDE. */
 enum class OnboardingStep { Welcome, Termux, Java, Toolchain, Ready }
 
-data class ProjectInfo(val name: String, val directory: File)
+data class ProjectInfo(
+    val name: String,
+    val directory: File,
+    val lastOpenedAt: Long? = null,
+)
 
 data class EditorTab(val file: File, val text: String, val savedText: String) {
     val name: String get() = file.name
@@ -52,6 +53,11 @@ data class EditorTab(val file: File, val text: String, val savedText: String) {
 }
 
 enum class BuildStatus { Idle, Running, Succeeded, Failed }
+
+enum class BuildVariant(val title: String, val description: String) {
+    Debug("Debug", "Build an APK and install it on this device."),
+    Release("Release", "Build an APK signed with your own release keystore."),
+}
 
 /**
  * Holds the IDE state shared by all screens: projects on disk, open editor tabs, the terminal
@@ -66,8 +72,12 @@ class IdeController(context: Context) {
     val compilerModule = CompilerModule(appContext)
     val workspace = File(compilerModule.terminal.bootstrap.homeDir, "projects")
 
-    var screen by mutableStateOf<Screen>(Screen.Projects)
-        private set
+    private val history = ProjectHistory(workspace)
+
+    /** The Navigation 3 back stack. The root is always the project list. */
+    val backStack = mutableStateListOf<NavKey>(ProjectsRoute)
+
+    val currentRoute: NavKey? get() = backStack.lastOrNull()
 
     var projects by mutableStateOf<List<ProjectInfo>>(emptyList())
         private set
@@ -94,10 +104,35 @@ class IdeController(context: Context) {
     var activeTabIndex by mutableStateOf(0)
         private set
 
+    /** Bumped after file-system changes so the file tree reloads. */
+    var filesRevision by mutableStateOf(0)
+        private set
+
     var buildStatus by mutableStateOf(BuildStatus.Idle)
         private set
 
     var buildLog by mutableStateOf<List<String>>(emptyList())
+        private set
+
+    var buildVariant by mutableStateOf(BuildVariant.Debug)
+
+    // Release signing.
+    var signingConfig by mutableStateOf<SigningConfig?>(null)
+        private set
+
+    var signedApkPath by mutableStateOf<String?>(null)
+        private set
+
+    var showKeystoreDialog by mutableStateOf(false)
+        private set
+
+    var keystoreName by mutableStateOf("release.keystore")
+    var keystoreAlias by mutableStateOf("release")
+    var keystorePassword by mutableStateOf("")
+    var keystorePasswordConfirmation by mutableStateOf("")
+    var keystoreValidityYears by mutableStateOf("30")
+
+    var keystoreBusy by mutableStateOf(false)
         private set
 
     // Terminal.
@@ -157,7 +192,9 @@ class IdeController(context: Context) {
 
     val bootstrap: TermuxBootstrap get() = compilerModule.terminal.bootstrap
     val isBuilding: Boolean get() = buildStatus == BuildStatus.Running
-    val currentProject: ProjectInfo? get() = (screen as? Screen.Editor)?.project
+
+    var currentProject by mutableStateOf<ProjectInfo?>(null)
+        private set
 
     val deviceAbi: String get() = SdkCatalog.deviceAbi
 
@@ -194,15 +231,15 @@ class IdeController(context: Context) {
         projectName = ""
         packageName = "com.example.hello"
         template = ProjectTemplate.JvmConsole
-        screen = Screen.NewProject
+        navigate(NewProjectRoute)
     }
 
     fun openSettings() {
-        screen = Screen.Settings
+        navigate(SettingsRoute)
     }
 
     fun openSdkDashboard() {
-        screen = Screen.SdkDashboard
+        navigate(SdkDashboardRoute)
         loadCatalog()
         refreshSetup()
     }
@@ -218,14 +255,22 @@ class IdeController(context: Context) {
     /** Leaves the first-run setup once the required components are installed. */
     fun dismissOnboarding() {
         onboardingDismissed = true
-        screen = Screen.Projects
+        backStack.clear()
+        backStack.add(ProjectsRoute)
     }
 
-    fun back() {
-        when (screen) {
-            is Screen.Editor -> closeEditor()
-            else -> screen = Screen.Projects
-        }
+    /** Pops the current route. Returns false when the back stack is already at its root. */
+    fun back(): Boolean {
+        if (backStack.size <= 1) return false
+
+        val removed = backStack.removeLastOrNull()
+        if (removed is EditorRoute) closeEditorState()
+        return true
+    }
+
+    private fun navigate(route: NavKey) {
+        if (backStack.lastOrNull() == route) return
+        backStack.add(route)
     }
 
     fun clearError() {
@@ -237,11 +282,9 @@ class IdeController(context: Context) {
     fun refreshProjects() {
         workspace.mkdirs()
 
-        projects = workspace.listFiles()
-            ?.filter { it.isDirectory && File(it, "project.yaml").isFile }
-            ?.map { ProjectInfo(name = it.name, directory = it) }
-            ?.sortedBy { it.name.lowercase() }
-            .orEmpty()
+        projects = history.entries().map {
+            ProjectInfo(name = it.name, directory = it.directory, lastOpenedAt = it.lastOpenedAt)
+        }
     }
 
     fun createProject() {
@@ -271,6 +314,8 @@ class IdeController(context: Context) {
                     )
                 }
 
+                // The editor replaces the creation form instead of stacking on top of it.
+                if (backStack.lastOrNull() is NewProjectRoute) backStack.removeLastOrNull()
                 refreshProjects()
                 openProject(ProjectInfo(name, directory))
             } catch (e: Exception) {
@@ -279,24 +324,79 @@ class IdeController(context: Context) {
         }
     }
 
+    /** Renames the project directory and returns whether the rename succeeded. */
+    fun renameProject(project: ProjectInfo, newName: String): Boolean {
+        val name = newName.trim()
+
+        if (!PROJECT_NAME.matches(name)) {
+            errorMessage = "Use letters, digits, '-' and '_' for the project name, starting with a letter."
+            return false
+        }
+
+        if (name == project.name) return true
+
+        val target = File(workspace, name)
+        if (target.exists()) {
+            errorMessage = "A project called '$name' already exists."
+            return false
+        }
+
+        if (!project.directory.renameTo(target)) {
+            errorMessage = "Could not rename '${project.name}'."
+            return false
+        }
+
+        history.rename(project.directory, target)
+        refreshProjects()
+        return true
+    }
+
+    fun deleteProject(project: ProjectInfo) {
+        if (!project.directory.deleteRecursively()) {
+            errorMessage = "Could not delete '${project.name}'."
+            return
+        }
+
+        history.forget(project.directory)
+        refreshProjects()
+    }
+
     fun openProject(project: ProjectInfo) {
+        history.markOpened(project.directory)
+        signingConfig = SigningConfig.load(project.directory)
+        signedApkPath = null
         tabs = emptyList()
         activeTabIndex = 0
         buildLog = emptyList()
         buildStatus = BuildStatus.Idle
-        screen = Screen.Editor(project)
+        currentProject = project
+        navigate(EditorRoute(project.directory.absolutePath))
         openTerminal(project.directory)
+        refreshProjects()
     }
 
     fun closeEditor() {
+        closeEditorState()
+        if (backStack.lastOrNull() is EditorRoute) backStack.removeLastOrNull()
+        refreshProjects()
+    }
+
+    private fun closeEditorState() {
+        buildJob?.cancel()
+        buildJob = null
         closeTerminal()
         tabs = emptyList()
         activeTabIndex = 0
         buildLog = emptyList()
         buildStatus = BuildStatus.Idle
-        screen = Screen.Projects
-        refreshProjects()
+        signingConfig = null
+        signedApkPath = null
+        currentProject = null
     }
+
+    /** The project behind an editor route, or null when it no longer exists in the workspace. */
+    fun projectFor(route: EditorRoute): ProjectInfo? =
+        projects.firstOrNull { it.directory.absolutePath == route.projectPath }
 
     // ---------------------------------------------------------------- editor
 
@@ -327,16 +427,145 @@ class IdeController(context: Context) {
         if (index in tabs.indices) activeTabIndex = index
     }
 
-    fun updateActiveTabText(text: String) {
-        val tab = tabs.getOrNull(activeTabIndex) ?: return
-        tabs = tabs.toMutableList().apply { set(activeTabIndex, tab.copy(text = text)) }
+    /** Applies an edit to the tab showing [file], even if another tab became active meanwhile. */
+    fun updateTabText(file: File, text: String) {
+        val index = tabs.indexOfFirst { it.file == file }
+        if (index < 0) return
+
+        val tab = tabs[index]
+        if (tab.text == text) return
+
+        tabs = tabs.toMutableList().apply { set(index, tab.copy(text = text)) }
     }
 
     fun closeTab(index: Int) {
         if (index !in tabs.indices) return
 
-        tabs = tabs.toMutableList().apply { removeAt(index) }
-        activeTabIndex = activeTabIndex.coerceIn(0, (tabs.size - 1).coerceAtLeast(0))
+        val wasActive = index == activeTabIndex
+        val remaining = tabs.toMutableList().apply { removeAt(index) }
+
+        activeTabIndex = when {
+            remaining.isEmpty() -> 0
+            wasActive -> index.coerceAtMost(remaining.lastIndex)
+            index < activeTabIndex -> activeTabIndex - 1
+            else -> activeTabIndex
+        }
+
+        tabs = remaining
+    }
+
+    /** Moves a tab to another position, keeping the selection on the same file. */
+    fun moveTab(from: Int, to: Int) {
+        if (from !in tabs.indices || to !in tabs.indices || from == to) return
+
+        val activeFile = tabs.getOrNull(activeTabIndex)?.file
+        val reordered = tabs.toMutableList().apply { add(to, removeAt(from)) }
+
+        tabs = reordered
+        activeTabIndex = reordered.indexOfFirst { it.file == activeFile }.coerceAtLeast(0)
+    }
+
+    // ---------------------------------------------------------------- project files
+
+    fun refreshFiles() {
+        filesRevision++
+    }
+
+    /** Creates an empty file at [relativePath] inside the project and opens it. */
+    fun createFile(project: ProjectInfo, relativePath: String): Boolean {
+        val path = relativePath.trim().replace('\\', '/')
+        if (path.isEmpty()) {
+            errorMessage = "Enter a file path."
+            return false
+        }
+
+        val target = resolveInside(project.directory, path)
+        if (target == null) {
+            errorMessage = "The file has to stay inside the project."
+            return false
+        }
+
+        if (target.exists()) {
+            errorMessage = "${target.name} already exists."
+            return false
+        }
+
+        try {
+            target.parentFile?.mkdirs()
+            if (!target.createNewFile()) {
+                errorMessage = "Could not create ${target.name}."
+                return false
+            }
+        } catch (e: Exception) {
+            errorMessage = "Could not create ${target.name}: ${e.message}"
+            return false
+        }
+
+        refreshFiles()
+        openFile(target)
+        return true
+    }
+
+    /** Renames a file or directory and keeps its open tabs pointing at the new location. */
+    fun renameFile(file: File, newName: String): Boolean {
+        val name = newName.trim()
+
+        if (name.isEmpty() || name.contains('/') || name.contains('\\') || name == "." || name == "..") {
+            errorMessage = "Enter a file name without directory separators."
+            return false
+        }
+
+        if (name == file.name) return true
+
+        val target = File(file.parentFile, name)
+        if (target.exists()) {
+            errorMessage = "${target.name} already exists."
+            return false
+        }
+
+        val wasDirectory = file.isDirectory
+        if (!file.renameTo(target)) {
+            errorMessage = "Could not rename ${file.name}."
+            return false
+        }
+
+        tabs = tabs.map { tab ->
+            when {
+                tab.file == file -> tab.copy(file = target)
+                wasDirectory && tab.file.path.startsWith(file.path + File.separator) ->
+                    tab.copy(file = File(target, tab.file.relativeTo(file).path))
+                else -> tab
+            }
+        }
+
+        refreshFiles()
+        return true
+    }
+
+    fun deleteFile(file: File) {
+        val activeFile = tabs.getOrNull(activeTabIndex)?.file
+        val remaining = tabs.filterNot { tab ->
+            tab.file == file || tab.file.path.startsWith(file.path + File.separator)
+        }
+
+        if (!file.deleteRecursively()) {
+            errorMessage = "Could not delete ${file.name}."
+            return
+        }
+
+        tabs = remaining
+        activeTabIndex = remaining.indexOfFirst { it.file == activeFile }
+            .takeIf { it >= 0 }
+            ?: remaining.lastIndex.coerceAtLeast(0)
+
+        refreshFiles()
+    }
+
+    private fun resolveInside(root: File, relativePath: String): File? {
+        val canonicalRoot = root.canonicalFile
+        val target = File(canonicalRoot, relativePath).canonicalFile
+
+        return target.takeIf { it.path.startsWith(canonicalRoot.path + File.separator) }
     }
 
     /** Writes dirty tabs back to disk. Returns false when a write failed. */
@@ -363,9 +592,24 @@ class IdeController(context: Context) {
 
     fun build() = runTask(task = "build")
 
-    fun install() = runTask(task = "package", installApkAfterwards = true)
+    fun install() = runTask(task = "build", installApkAfterwards = true)
 
-    private fun runTask(task: String, installApkAfterwards: Boolean = false) {
+    /** Builds the project and signs the produced APK with the project's release keystore. */
+    fun signApk() {
+        if (signingConfig == null) {
+            openKeystoreDialog()
+            errorMessage = "Generate a keystore before signing a release APK."
+            return
+        }
+
+        runTask(task = "build", signApkAfterwards = true)
+    }
+
+    private fun runTask(
+        task: String,
+        installApkAfterwards: Boolean = false,
+        signApkAfterwards: Boolean = false,
+    ) {
         val project = currentProject ?: return
         if (isBuilding) return
         if (!saveAll()) return
@@ -417,6 +661,10 @@ class IdeController(context: Context) {
                 if (installApkAfterwards && buildStatus == BuildStatus.Succeeded) {
                     installApk(project.directory)
                 }
+
+                if (signApkAfterwards && buildStatus == BuildStatus.Succeeded) {
+                    signBuiltApk(project.directory)
+                }
             } catch (e: Exception) {
                 buildStatus = BuildStatus.Failed
                 appendLog("Build failed: ${e.message}")
@@ -425,10 +673,7 @@ class IdeController(context: Context) {
     }
 
     private fun installApk(projectDirectory: File) {
-        val apk = projectDirectory.walkTopDown()
-            .onEnter { it.name != ".git" }
-            .filter { it.isFile && it.extension == "apk" }
-            .maxByOrNull(File::lastModified)
+        val apk = compilerModule.signer.findApk(projectDirectory)
 
         if (apk == null) {
             buildStatus = BuildStatus.Failed
@@ -446,8 +691,113 @@ class IdeController(context: Context) {
         }
     }
 
+    private suspend fun signBuiltApk(projectDirectory: File) {
+        val config = signingConfig ?: return
+        val apk = compilerModule.signer.findApk(projectDirectory)
+
+        if (apk == null) {
+            buildStatus = BuildStatus.Failed
+            appendLog("No APK was produced. Signing is only available for Android app projects.")
+            return
+        }
+
+        appendLog("Signing ${apk.name} with alias '${config.alias}'…")
+
+        try {
+            val signed = withContext(Dispatchers.IO) {
+                compilerModule.signer.sign(projectDirectory, apk, config)
+            }
+
+            signedApkPath = signed.absolutePath
+            appendLog("Signed APK: ${signed.absolutePath}")
+        } catch (e: Exception) {
+            buildStatus = BuildStatus.Failed
+            appendLog("Signing failed: ${e.message}")
+        }
+    }
+
     private fun appendLog(line: String) {
         buildLog = (buildLog + line).takeLast(MAX_LOG_LINES)
+    }
+
+    // ---------------------------------------------------------------- signing
+
+    fun openKeystoreDialog() {
+        keystoreName = if (signingConfig == null) "release.keystore" else "release-new.keystore"
+        keystoreAlias = signingConfig?.alias ?: "release"
+        keystorePassword = ""
+        keystorePasswordConfirmation = ""
+        keystoreValidityYears = "30"
+        showKeystoreDialog = true
+    }
+
+    fun dismissKeystoreDialog() {
+        if (!keystoreBusy) showKeystoreDialog = false
+    }
+
+    fun generateKeystore() {
+        val project = currentProject ?: return
+        if (keystoreBusy) return
+
+        val password = keystorePassword
+        if (password.length < 6) {
+            errorMessage = "Use a keystore password of at least 6 characters."
+            return
+        }
+
+        if (password != keystorePasswordConfirmation) {
+            errorMessage = "The passwords do not match."
+            return
+        }
+
+        val fileName = keystoreName.trim().let { name ->
+            when {
+                name.isEmpty() -> "release.keystore"
+                name.endsWith(".keystore") || name.endsWith(".jks") -> name
+                else -> "$name.keystore"
+            }
+        }
+
+        val alias = keystoreAlias.trim()
+        if (alias.isEmpty()) {
+            errorMessage = "Enter a key alias."
+            return
+        }
+
+        val validity = keystoreValidityYears.trim().toIntOrNull()
+        if (validity == null || validity !in 1..1000) {
+            errorMessage = "Enter the validity in years, between 1 and 1000."
+            return
+        }
+
+        keystoreBusy = true
+
+        scope.launch {
+            try {
+                val config = withContext(Dispatchers.IO) {
+                    compilerModule.signer.generateKeystore(
+                        projectDirectory = project.directory,
+                        request = KeystoreRequest(
+                            fileName = fileName,
+                            alias = alias,
+                            password = password,
+                            validityYears = validity,
+                            commonName = project.name,
+                        ),
+                    )
+                }
+
+                signingConfig = config
+                showKeystoreDialog = false
+                keystorePassword = ""
+                keystorePasswordConfirmation = ""
+                appendLog("Generated keystore ${config.keystore.name} with alias '${config.alias}'")
+            } catch (e: Exception) {
+                errorMessage = e.message ?: "Could not generate the keystore."
+            } finally {
+                keystoreBusy = false
+            }
+        }
     }
 
     // ---------------------------------------------------------------- terminal
@@ -715,11 +1065,16 @@ class IdeController(context: Context) {
 
     private fun formatSize(bytes: Long, total: Long?): String {
         val downloaded = "%.1f MB".format(bytes / 1024.0 / 1024.0)
-        return if (total != null && total > 0) "$downloaded / ${"%.1f MB".format(total / 1024.0 / 1024.0)}" else downloaded
+        return if (total != null && total > 0) {
+            "$downloaded / ${"%.1f MB".format(total / 1024.0 / 1024.0)}"
+        } else {
+            downloaded
+        }
     }
 
     private companion object {
         const val MAX_LOG_LINES = 2_000
         const val MAX_EDITABLE_FILE_SIZE = 512L * 1024L
+        val PROJECT_NAME = Regex("[A-Za-z][A-Za-z0-9_-]*")
     }
 }

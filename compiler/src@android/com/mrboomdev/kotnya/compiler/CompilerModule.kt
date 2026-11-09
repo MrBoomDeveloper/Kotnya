@@ -17,4 +17,5 @@ class CompilerModule(context: Context) {
     val catalog = SdkCatalog()
     val compiler = KotlinCompiler(terminal)
     val projects = KotlinProjectGenerator()
+    val signer = AndroidApkSigner(terminal) { androidSdk.status() }
 }
