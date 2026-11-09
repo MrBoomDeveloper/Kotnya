@@ -1,0 +1,27 @@
+product: android/app
+
+dependencies:
+  - //library
+  - //terminal
+  - //compiler
+  - $libs.androidx.activity.compose
+  - $compose.runtime
+  - $compose.foundation
+  - $compose.preview
+  - $compose.uiTooling
+  - androidx.compose.foundation:foundation-layout:1.12.1
+  - androidx.compose.material3:material3:1.5.0-alpha22
+
+settings:
+  compose: enabled
+  android:
+    namespace: com.mrboomdev.kotnya
+    applicationId: com.mrboomdev.kotnya
+    versionCode: 1
+    versionName: "1.0.0"
+    minSdk: 26
+    compileSdk: 37
+    # Termux runs its binaries (bash, tar, pkg, java...) from the app's private data directory.
+    # Android 10+ blocks exec from writable app data for apps targeting API 29+, which is exactly
+    # how Termux itself works around it. Raise this only together with a different exec strategy.
+    targetSdk: 28

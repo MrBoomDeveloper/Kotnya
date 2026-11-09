@@ -1,0 +1,24 @@
+product:
+  type:
+    kmp/lib
+  platforms:
+    - android
+    - jvm
+
+aliases:
+  # Project generation and SDK paths use only java.io, so they are shared with the JVM target
+  # where they can be unit tested without a device.
+  - jvmAndAndroid: [jvm, android]
+
+description: Kotlin Toolchain management, compilation runs and project generation on top of the terminal module.
+
+dependencies:
+  - $libs.kotlinx.coroutines.core
+
+dependencies@android:
+  - //terminal: exported
+
+settings:
+  android:
+    namespace: com.mrboomdev.kotnya.compiler
+    minSdk: 26

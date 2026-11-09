@@ -1,0 +1,26 @@
+product:
+  type:
+    kmp/lib
+  platforms:
+    - android
+
+description: Embedded Termux terminal emulator, user-land bootstrap and shell execution.
+
+repositories:
+  - id: jitpack
+    url: https://jitpack.io
+
+dependencies:
+  # Termux terminal emulator and the renderer View, published from termux/termux-app.
+  # terminal-emulator brings libtermux.so (the PTY/JNI layer) for all Android ABIs.
+  - com.github.termux.termux-app:terminal-view:0.117
+  - $libs.kotlinx.coroutines.core
+  - $compose.runtime
+  - $compose.foundation
+  - $compose.ui
+
+settings:
+  compose: enabled
+  android:
+    namespace: com.mrboomdev.kotnya.terminal
+    minSdk: 26
