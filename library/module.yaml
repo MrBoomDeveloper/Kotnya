@@ -6,4 +6,4 @@ product:
 
 settings:
   android:
-    namespace: com.mrboomdev.kotlincli
+    namespace: com.mrboomdev.kotnya.library
